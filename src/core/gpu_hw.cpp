@@ -156,6 +156,8 @@ GPU_HW::GPU_HW() : GPU()
 
 GPU_HW::~GPU_HW()
 {
+  GPUTextureCache::Shutdown();
+
   if (m_sw_renderer)
   {
     m_sw_renderer->Shutdown();
@@ -226,6 +228,8 @@ bool GPU_HW::Initialize()
   m_wireframe_mode = g_settings.gpu_wireframe_mode;
   m_disable_color_perspective = features.noperspective_interpolation && ShouldDisableColorPerspective();
   m_pgxp_depth_buffer = g_settings.UsingPGXPDepthBuffer();
+  m_use_texture_cache = g_settings.gpu_texture_cache;
+  m_texture_dumping = m_use_texture_cache && g_settings.texture_replacements.dump_textures;
 
   CheckSettings();
 
@@ -245,12 +249,19 @@ bool GPU_HW::Initialize()
     return false;
   }
 
+  if (m_use_texture_cache)
+    GPUTextureCache::Initialize();
+
   RestoreDeviceContext();
   return true;
 }
 
 void GPU_HW::Reset(bool clear_vram)
 {
+  // Texture cache needs to be invalidated before we load, otherwise we dump black.
+  if (m_use_texture_cache)
+    GPUTextureCache::Invalidate();
+
   if (m_batch_vertex_ptr)
     UnmapGPUBuffer(0, 0);
 
@@ -271,6 +282,7 @@ void GPU_HW::Reset(bool clear_vram)
 
 bool GPU_HW::DoState(StateWrapper& sw, GPUTexture** host_texture, bool update_display)
 {
+  // Would invalidate the TC, but base DoState() calls Reset().
   if (!GPU::DoState(sw, host_texture, update_display))
     return false;
 
@@ -315,7 +327,12 @@ bool GPU_HW::DoState(StateWrapper& sw, GPUTexture** host_texture, bool update_di
   {
     DebugAssert(!m_batch_vertex_ptr && !m_batch_index_ptr);
     SetFullVRAMDirtyRectangle();
+    UpdateVRAMReadTexture(true, true);
     ResetBatchVertexDepth();
+
+    // Need to invalidate TC again, to remove the write for state restore.
+    if (m_use_texture_cache)
+      GPUTextureCache::Invalidate();
   }
 
   return true;
@@ -413,6 +430,8 @@ void GPU_HW::UpdateSettings(const Settings& old_settings)
   m_downsample_mode = downsample_mode;
   m_wireframe_mode = wireframe_mode;
   m_disable_color_perspective = disable_color_perspective;
+  m_use_texture_cache = g_settings.gpu_texture_cache;
+  m_texture_dumping = m_use_texture_cache && g_settings.texture_replacements.dump_textures;
 
   CheckSettings();
 
@@ -452,6 +471,13 @@ void GPU_HW::UpdateSettings(const Settings& old_settings)
     UpdateDepthBufferFromMaskBit();
     UpdateDisplay();
   }
+
+  if (m_use_texture_cache && !old_settings.gpu_texture_cache)
+    GPUTextureCache::Initialize();
+  else if (!m_use_texture_cache && old_settings.gpu_texture_cache)
+    GPUTextureCache::Shutdown();
+  else if (m_use_texture_cache)
+    GPUTextureCache::UpdateSettings(old_settings);
 }
 
 void GPU_HW::CheckSettings()
@@ -616,18 +642,31 @@ void GPU_HW::AddWrittenRectangle(const GSVector4i rect)
 {
   m_vram_dirty_write_rect = m_vram_dirty_write_rect.runion(rect);
   SetTexPageChangedOnOverlap(m_vram_dirty_write_rect);
+
+  if (m_use_texture_cache)
+    GPUTextureCache::AddWrittenRectangle(rect);
 }
 
 void GPU_HW::AddDrawnRectangle(const GSVector4i rect)
 {
-  m_vram_dirty_draw_rect = m_vram_dirty_draw_rect.runion(rect.rintersect(m_clamped_drawing_area));
-  SetTexPageChangedOnOverlap(m_vram_dirty_draw_rect);
+  if (!rect.rintersects(m_clamped_drawing_area) || m_current_draw_rect.rcontains(rect))
+    return;
+
+  m_current_draw_rect = m_current_draw_rect.runion(rect.rintersect(m_clamped_drawing_area));
+  m_vram_dirty_draw_rect = m_vram_dirty_draw_rect.runion(m_current_draw_rect);
+
+  SetTexPageChangedOnOverlap(m_current_draw_rect);
+
+  if (m_use_texture_cache)
+    GPUTextureCache::AddDrawnRectangle(m_current_draw_rect);
 }
 
 void GPU_HW::AddUnclampedDrawnRectangle(const GSVector4i rect)
 {
   m_vram_dirty_draw_rect = m_vram_dirty_draw_rect.runion(rect);
   SetTexPageChangedOnOverlap(m_vram_dirty_draw_rect);
+  if (m_use_texture_cache)
+    GPUTextureCache::AddDrawnRectangle(rect);
 }
 
 void GPU_HW::SetTexPageChangedOnOverlap(const GSVector4i update_rect)
@@ -635,9 +674,9 @@ void GPU_HW::SetTexPageChangedOnOverlap(const GSVector4i update_rect)
   // the vram area can include the texture page, but the game can leave it as-is. in this case, set it as dirty so the
   // shadow texture is updated
   if (!m_draw_mode.IsTexturePageChanged() &&
-      (m_draw_mode.mode_reg.GetTexturePageRectangle().rintersects(update_rect) ||
+      (GetTextureRect(m_draw_mode.mode_reg.texture_page, m_draw_mode.mode_reg.texture_mode).rintersects(update_rect) ||
        (m_draw_mode.mode_reg.IsUsingPalette() &&
-        m_draw_mode.palette_reg.GetRectangle(m_draw_mode.mode_reg.texture_mode).rintersects(update_rect))))
+        GetPaletteRect(m_draw_mode.palette_reg, m_draw_mode.mode_reg.texture_mode).rintersects(update_rect))))
   {
     m_draw_mode.SetTexturePageChanged();
   }
@@ -761,6 +800,8 @@ void GPU_HW::ClearFramebuffer()
   if (m_vram_depth_texture)
     g_gpu_device->ClearDepth(m_vram_depth_texture.get(), m_pgxp_depth_buffer ? 1.0f : 0.0f);
   ClearVRAMDirtyRectangle();
+  if (m_use_texture_cache)
+    GPUTextureCache::Invalidate();
   m_last_depth_z = 1.0f;
 }
 
@@ -1501,15 +1542,24 @@ void GPU_HW::UnmapGPUBuffer(u32 used_vertices, u32 used_indices)
 }
 
 ALWAYS_INLINE_RELEASE void GPU_HW::DrawBatchVertices(BatchRenderMode render_mode, u32 num_indices, u32 base_index,
-                                                     u32 base_vertex)
+                                                     u32 base_vertex, const GPUTextureCache::Source* texture)
 {
   // [depth_test][transparency_mode][render_mode][texture_mode][dithering][interlacing][check_mask]
   const u8 depth_test = BoolToUInt8(m_batch.use_depth_buffer);
   const u8 check_mask = BoolToUInt8(m_batch.check_mask_before_draw);
+  const GPUTextureMode real_texture_mode =
+    texture ? ((m_batch.texture_mode & GPUTextureMode::RawTextureBit) | GPUTextureMode::Reserved_Direct16Bit) :
+              m_batch.texture_mode;
   g_gpu_device->SetPipeline(m_batch_pipelines[depth_test][static_cast<u8>(m_batch.transparency_mode)][static_cast<u8>(
-    render_mode)][static_cast<u8>(m_batch.texture_mode)][BoolToUInt8(m_batch.dithering)]
-                                             [BoolToUInt8(m_batch.interlacing)][check_mask]
+    render_mode)][static_cast<u8>(real_texture_mode)][BoolToUInt8(m_batch.dithering)][BoolToUInt8(m_batch.interlacing)]
+                                             [check_mask]
                                                .get());
+
+  // TOOD: Totally not optimized.
+  if (texture)
+    g_gpu_device->SetTextureSampler(0, texture->texture, g_gpu_device->GetNearestSampler());
+  else if (real_texture_mode != GPUTextureMode::Disabled)
+    g_gpu_device->SetTextureSampler(0, m_vram_read_texture.get(), g_gpu_device->GetNearestSampler());
 
   if (render_mode != BatchRenderMode::ShaderBlend || m_supports_framebuffer_fetch)
     g_gpu_device->DrawIndexed(num_indices, base_index, base_vertex);
@@ -1804,7 +1854,7 @@ void GPU_HW::ComputePolygonUVLimits(BatchVertex* vertices, u32 num_vertices)
   for (u32 i = 0; i < num_vertices; i++)
     vertices[i].SetUVLimits(min_u, max_u, min_v, max_v);
 
-  if (m_texpage_dirty != 0)
+  if (ShouldCheckForTexPageOverlap())
     CheckForTexPageOverlap(min.upl32(max).u16to32());
 }
 
@@ -2202,7 +2252,7 @@ void GPU_HW::LoadVertices()
           const u16 tex_right = tex_left + static_cast<u16>(quad_width);
           const u32 uv_limits = BatchVertex::PackUVLimits(tex_left, tex_right - 1, tex_top, tex_bottom - 1);
 
-          if (rc.texture_enable && m_texpage_dirty != 0)
+          if (rc.texture_enable && ShouldCheckForTexPageOverlap())
           {
             // TODO: Skip applying texture window if not enabled.
             const auto [u_min, u_max] = MinMax(
@@ -2432,7 +2482,7 @@ bool GPU_HW::BlitVRAMReplacementTexture(const TextureReplacements::ReplacementIm
 
 ALWAYS_INLINE_RELEASE void GPU_HW::CheckForTexPageOverlap(GSVector4i uv_rect)
 {
-  DebugAssert(m_texpage_dirty != 0 && m_batch.texture_mode != GPUTextureMode::Disabled);
+  DebugAssert((m_texpage_dirty != 0 || m_texture_dumping) && m_batch.texture_mode != GPUTextureMode::Disabled);
 
   const GPUTextureMode tmode = m_draw_mode.mode_reg.texture_mode;
   const u32 xshift = (tmode >= GPUTextureMode::Direct16Bit) ? 0 : (2 - static_cast<u8>(tmode));
@@ -2451,6 +2501,33 @@ ALWAYS_INLINE_RELEASE void GPU_HW::CheckForTexPageOverlap(GSVector4i uv_rect)
     m_current_uv_rect = new_uv_rect;
 
     bool update_drawn = false, update_written = false;
+    if (m_texpage_dirty & TEXPAGE_DIRTY_PAGE_RECT)
+    {
+      DebugAssert(!(m_texpage_dirty & (TEXPAGE_DIRTY_DRAWN_RECT | TEXPAGE_DIRTY_WRITTEN_RECT)));
+      DebugAssert(m_batch.use_texture_cache && m_batch.texture_cache_key.page < NUM_VRAM_PAGES);
+
+      if (GPUTextureCache::AreSourcePagesDrawn(m_batch.texture_cache_key, m_current_uv_rect))
+      {
+        // UVs intersect with drawn area, can't use TC
+        if (m_batch_index_count > 0)
+        {
+          FlushRender();
+          EnsureVertexBufferSpaceForCurrentCommand();
+        }
+
+        // We need to swap the dirty tracking over to drawn/written.
+        const GSVector4i page_rect = GetTextureRect(m_batch.texture_cache_key.page, m_batch.texture_cache_key.mode);
+        m_texpage_dirty = (m_vram_dirty_draw_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_DRAWN_RECT : 0) |
+                          (m_vram_dirty_write_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_WRITTEN_RECT : 0);
+        m_compute_uv_range = (ShouldCheckForTexPageOverlap() || m_clamp_uvs);
+        m_batch.use_texture_cache = false;
+      }
+      else
+      {
+        // Page isn't drawn, we're done.
+        return;
+      }
+    }
     if (m_texpage_dirty & TEXPAGE_DIRTY_DRAWN_RECT)
     {
       DebugAssert(!m_vram_dirty_draw_rect.eq(INVALID_RECT));
@@ -2483,6 +2560,11 @@ ALWAYS_INLINE_RELEASE void GPU_HW::CheckForTexPageOverlap(GSVector4i uv_rect)
       UpdateVRAMReadTexture(update_drawn, update_written);
     }
   }
+}
+
+bool GPU_HW::ShouldCheckForTexPageOverlap() const
+{
+  return (m_texpage_dirty != 0);
 }
 
 ALWAYS_INLINE bool GPU_HW::IsFlushed() const
@@ -2656,7 +2738,21 @@ void GPU_HW::FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color)
   GL_INS_FMT("Dirty draw area before: {}", m_vram_dirty_draw_rect);
 
   const GSVector4i bounds = GetVRAMTransferBounds(x, y, width, height);
-  AddUnclampedDrawnRectangle(bounds);
+
+  // If TC is enabled, we have to update local memory.
+  if (m_use_texture_cache && !IsInterlacedRenderingEnabled())
+  {
+    if (m_sw_renderer)
+      m_sw_renderer->Sync(true);
+    else
+      GPU::FillVRAM(x, y, width, height, color);
+
+    AddWrittenRectangle(bounds);
+  }
+  else
+  {
+    AddUnclampedDrawnRectangle(bounds);
+  }
 
   GL_INS_FMT("Dirty draw area after: {}", m_vram_dirty_draw_rect);
 
@@ -2701,6 +2797,8 @@ void GPU_HW::ReadVRAM(u32 x, u32 y, u32 width, u32 height)
     GL_POP();
     return;
   }
+
+  // TODO: Only read if it's in the drawn area
 
   // Get bounds with wrap-around handled.
   GSVector4i copy_rect = GetVRAMTransferBounds(x, y, width, height);
@@ -2753,7 +2851,21 @@ void GPU_HW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, b
 {
   GL_SCOPE_FMT("UpdateVRAM({},{} => {},{} ({}x{})", x, y, x + width, y + height, width, height);
 
-  if (m_sw_renderer)
+  // TODO: Handle wrapped transfers... break them up or something
+  const GSVector4i bounds = GetVRAMTransferBounds(x, y, width, height);
+  DebugAssert(bounds.right <= static_cast<s32>(VRAM_WIDTH) && bounds.bottom <= static_cast<s32>(VRAM_HEIGHT));
+  AddWrittenRectangle(bounds);
+
+  // We want to dump *before* the write goes through, otherwise we dump bad data.
+  if (m_use_texture_cache)
+  {
+    if (m_sw_renderer)
+      m_sw_renderer->Sync(true);
+
+    GPU::UpdateVRAM(x, y, width, height, data, set_mask, check_mask);
+    GPUTextureCache::TrackVRAMWrite(bounds);
+  }
+  else if (m_sw_renderer)
   {
     const u32 num_words = width * height;
     GPUBackendUpdateVRAMCommand* cmd = m_sw_renderer->NewUpdateVRAMCommand(num_words);
@@ -2767,10 +2879,6 @@ void GPU_HW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, b
     std::memcpy(cmd->data, data, sizeof(u16) * num_words);
     m_sw_renderer->PushCommand(cmd);
   }
-
-  const GSVector4i bounds = GetVRAMTransferBounds(x, y, width, height);
-  DebugAssert(bounds.right <= static_cast<s32>(VRAM_WIDTH) && bounds.bottom <= static_cast<s32>(VRAM_HEIGHT));
-  AddWrittenRectangle(bounds);
 
   if (check_mask)
   {
@@ -2787,6 +2895,12 @@ void GPU_HW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, b
     }
   }
 
+  UpdateVRAMOnGPU(x, y, width, height, data, sizeof(u16) * width, set_mask, check_mask, bounds);
+}
+
+void GPU_HW::UpdateVRAMOnGPU(u32 x, u32 y, u32 width, u32 height, const void* data, u32 data_pitch, bool set_mask,
+                             bool check_mask, const GSVector4i bounds)
+{
   std::unique_ptr<GPUTexture> upload_texture;
   u32 map_index;
 
@@ -2794,7 +2908,7 @@ void GPU_HW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, b
   {
     map_index = 0;
     upload_texture = g_gpu_device->FetchTexture(width, height, 1, 1, 1, GPUTexture::Type::Texture,
-                                                GPUTexture::Format::R16U, data, width * sizeof(u16));
+                                                GPUTexture::Format::R16U, data, data_pitch);
     if (!upload_texture)
     {
       ERROR_LOG("Failed to get {}x{} upload texture. Things are gonna break.", width, height);
@@ -2804,9 +2918,10 @@ void GPU_HW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, b
   else
   {
     const u32 num_pixels = width * height;
+    const u32 dst_pitch = width * sizeof(u16);
     void* map = m_vram_upload_buffer->Map(num_pixels);
     map_index = m_vram_upload_buffer->GetCurrentPosition();
-    std::memcpy(map, data, num_pixels * sizeof(u16));
+    StringUtil::StrideMemCpy(map, dst_pitch, data, data_pitch, dst_pitch, height);
     m_vram_upload_buffer->Unmap(num_pixels);
   }
 
@@ -2851,7 +2966,32 @@ void GPU_HW::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32
 {
   GL_SCOPE_FMT("CopyVRAM({}x{} @ {},{} => {},{}", width, height, src_x, src_y, dst_x, dst_y);
 
-  if (m_sw_renderer)
+  // masking enabled, oversized, or overlapping
+  const bool use_shader =
+    (m_GPUSTAT.IsMaskingEnabled() || ((src_x % VRAM_WIDTH) + width) > VRAM_WIDTH ||
+     ((src_y % VRAM_HEIGHT) + height) > VRAM_HEIGHT || ((dst_x % VRAM_WIDTH) + width) > VRAM_WIDTH ||
+     ((dst_y % VRAM_HEIGHT) + height) > VRAM_HEIGHT);
+  const GSVector4i src_bounds = GetVRAMTransferBounds(src_x, src_y, width, height);
+  const GSVector4i dst_bounds = GetVRAMTransferBounds(dst_x, dst_y, width, height);
+
+  // If we're copying a region that hasn't been drawn to, and we're using the TC, we can do it in local memory.
+  if (m_use_texture_cache && !GPUTextureCache::IsRectDrawn(src_bounds))
+  {
+    GL_INS("Performed in local memory.");
+
+    if (m_sw_renderer)
+      m_sw_renderer->Sync(true);
+
+    GPUTextureCache::AddWrittenRectangle(dst_bounds);
+    // GPUTextureCache::AddCopiedRectanglePart1(dst_bounds); // needed for FF8 because it animates textures by copying
+    GPU::CopyVRAM(src_x, src_y, dst_x, dst_y, width, height);
+    UpdateVRAMOnGPU(dst_bounds.left, dst_bounds.top, dst_bounds.width(), dst_bounds.height(),
+                    &g_vram[dst_bounds.top * VRAM_WIDTH + dst_bounds.left], VRAM_WIDTH * sizeof(u16), false, false,
+                    dst_bounds);
+    // GPUTextureCache::AddCopiedRectanglePart2(dst_bounds);
+    return;
+  }
+  else if (m_sw_renderer)
   {
     GPUBackendCopyVRAMCommand* cmd = m_sw_renderer->NewCopyVRAMCommand();
     FillBackendCommandParameters(cmd);
@@ -2864,16 +3004,8 @@ void GPU_HW::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32
     m_sw_renderer->PushCommand(cmd);
   }
 
-  // masking enabled, oversized, or overlapping
-  const bool use_shader =
-    (m_GPUSTAT.IsMaskingEnabled() || ((src_x % VRAM_WIDTH) + width) > VRAM_WIDTH ||
-     ((src_y % VRAM_HEIGHT) + height) > VRAM_HEIGHT || ((dst_x % VRAM_WIDTH) + width) > VRAM_WIDTH ||
-     ((dst_y % VRAM_HEIGHT) + height) > VRAM_HEIGHT);
-  const GSVector4i src_bounds = GetVRAMTransferBounds(src_x, src_y, width, height);
-  const GSVector4i dst_bounds = GetVRAMTransferBounds(dst_x, dst_y, width, height);
   const bool intersect_with_draw = m_vram_dirty_draw_rect.rintersects(src_bounds);
   const bool intersect_with_write = m_vram_dirty_write_rect.rintersects(src_bounds);
-
   if (use_shader || IsUsingMultisampling())
   {
     if (intersect_with_draw || intersect_with_write)
@@ -2929,7 +3061,8 @@ void GPU_HW::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32
       UpdateVRAMReadTexture(intersect_with_draw, intersect_with_write);
   }
 
-  if (intersect_with_draw)
+  // We don't have it in local memory, so TC can't read it.
+  if (intersect_with_draw || m_use_texture_cache)
   {
     AddUnclampedDrawnRectangle(dst_bounds);
   }
@@ -2965,70 +3098,91 @@ void GPU_HW::DispatchRenderCommand()
 {
   const GPURenderCommand rc{m_render_command.bits};
 
+  // TODO: avoid all this for vertex loading, only do when the type of draw changes
   GPUTextureMode texture_mode;
+  GPUTextureCache::SourceKey texture_cache_key = m_batch.texture_cache_key;
+  bool use_texture_cache = m_batch.use_texture_cache;
   if (rc.IsTexturingEnabled())
   {
+    texture_mode =
+      ((m_draw_mode.mode_reg.texture_mode == GPUTextureMode::Reserved_Direct16Bit) ? GPUTextureMode::Direct16Bit :
+                                                                                     m_draw_mode.mode_reg.texture_mode);
+
     // texture page changed - check that the new page doesn't intersect the drawing area
     if (m_draw_mode.IsTexturePageChanged())
     {
       m_draw_mode.ClearTexturePageChangedFlag();
 
-#if 1
-      if (!m_vram_dirty_draw_rect.eq(INVALID_RECT) || !m_vram_dirty_write_rect.eq(INVALID_RECT))
-      {
-        GL_INS_FMT("VRAM DIRTY: {} {}", m_vram_dirty_draw_rect, m_vram_dirty_write_rect);
-        GL_INS_FMT("PAGE RECT: {}", m_draw_mode.mode_reg.GetTexturePageRectangle());
-        if (m_draw_mode.mode_reg.IsUsingPalette())
-          GL_INS_FMT("PALETTE RECT: {}", m_draw_mode.palette_reg.GetRectangle(m_draw_mode.mode_reg.texture_mode));
-      }
-#endif
+      // start by assuming we can use the TC
+      use_texture_cache = m_use_texture_cache;
 
+      // check that the palette isn't in a drawn area
       if (m_draw_mode.mode_reg.IsUsingPalette())
       {
-        const GSVector4i palette_rect = m_draw_mode.palette_reg.GetRectangle(m_draw_mode.mode_reg.texture_mode);
-        const bool update_drawn = palette_rect.rintersects(m_vram_dirty_draw_rect);
-        const bool update_written = palette_rect.rintersects(m_vram_dirty_write_rect);
-        if (update_drawn || update_written)
+        const GSVector4i palette_rect = GetPaletteRect(m_draw_mode.palette_reg, m_draw_mode.mode_reg.texture_mode);
+        if (!use_texture_cache || GPUTextureCache::IsRectDrawn(palette_rect))
         {
-          GL_INS("Palette in VRAM dirty area, flushing cache");
-          if (!IsFlushed())
-            FlushRender();
+          if (use_texture_cache)
+            GL_INS_FMT("Palette at {} is in drawn area, can't use TC", palette_rect);
+          use_texture_cache = false;
 
-          UpdateVRAMReadTexture(update_drawn, update_written);
+          const bool update_drawn = palette_rect.rintersects(m_vram_dirty_draw_rect);
+          const bool update_written = palette_rect.rintersects(m_vram_dirty_write_rect);
+          if (update_drawn || update_written)
+          {
+            GL_INS("Palette in VRAM dirty area, flushing cache");
+            if (!IsFlushed())
+              FlushRender();
+
+            UpdateVRAMReadTexture(update_drawn, update_written);
+          }
         }
       }
 
-      const GSVector4i page_rect = m_draw_mode.mode_reg.GetTexturePageRectangle();
-      u8 new_texpage_dirty = m_vram_dirty_draw_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_DRAWN_RECT : 0;
-      new_texpage_dirty |= m_vram_dirty_write_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_WRITTEN_RECT : 0;
+      m_compute_uv_range = (m_clamp_uvs || m_texture_dumping);
 
-      if (new_texpage_dirty != 0)
+      const GSVector4i page_rect = GetTextureRect(m_draw_mode.mode_reg.texture_page, m_draw_mode.mode_reg.texture_mode);
+      if (use_texture_cache)
       {
-        GL_INS("Texpage is in dirty area, checking UV ranges");
-        m_texpage_dirty = new_texpage_dirty;
-        m_compute_uv_range = true;
-        m_current_uv_rect = INVALID_RECT;
+        texture_cache_key =
+          GPUTextureCache::SourceKey(m_draw_mode.mode_reg.texture_page, m_draw_mode.palette_reg, texture_mode);
+
+        const bool is_drawn = GPUTextureCache::IsRectDrawn(page_rect);
+        if (is_drawn)
+          GL_INS_FMT("Texpage [{}] {} is drawn in TC, checking UV ranges", texture_cache_key.page, page_rect);
+
+        m_texpage_dirty =
+          (is_drawn ? TEXPAGE_DIRTY_PAGE_RECT : 0) | (m_texture_dumping ? TEXPAGE_DIRTY_ONLY_UV_RECT : 0);
+        m_compute_uv_range = ShouldCheckForTexPageOverlap();
       }
       else
       {
-        m_compute_uv_range = m_clamp_uvs;
-        if (m_texpage_dirty)
-          GL_INS("Texpage is no longer dirty");
-        m_texpage_dirty = 0;
+        m_texpage_dirty = (m_vram_dirty_draw_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_DRAWN_RECT : 0) |
+                          (m_vram_dirty_write_rect.rintersects(page_rect) ? TEXPAGE_DIRTY_WRITTEN_RECT : 0);
+        if (m_texpage_dirty & TEXPAGE_DIRTY_DRAWN_RECT)
+          GL_INS_FMT("Texpage {} is in dirty DRAWN area {}", page_rect, m_vram_dirty_draw_rect);
+        if (m_texpage_dirty & TEXPAGE_DIRTY_WRITTEN_RECT)
+          GL_INS_FMT("Texpage {} is in dirty WRITTEN area {}", page_rect, m_vram_dirty_write_rect);
+
+        // Current UV rect _must_ be cleared here, because we're only check for texpage intersection when it grows in
+        // size, a switch from a non-contained page to a contained page would go undetected otherwise.
+        if (m_texpage_dirty != 0)
+        {
+          m_compute_uv_range = true;
+          m_current_uv_rect = INVALID_RECT;
+        }
       }
     }
 
-    texture_mode = m_draw_mode.mode_reg.texture_mode;
-    if (rc.raw_texture_enable)
-    {
-      texture_mode =
-        static_cast<GPUTextureMode>(static_cast<u8>(texture_mode) | static_cast<u8>(GPUTextureMode::RawTextureBit));
-    }
+    texture_mode = static_cast<GPUTextureMode>(
+      static_cast<u8>(texture_mode) | (rc.raw_texture_enable ? static_cast<u8>(GPUTextureMode::RawTextureBit) : 0));
   }
   else
   {
     texture_mode = GPUTextureMode::Disabled;
   }
+
+  DebugAssert(!(m_texpage_dirty & TEXPAGE_DIRTY_PAGE_RECT) || use_texture_cache || !rc.texture_enable);
 
   // has any state changed which requires a new batch?
   // Reverse blending breaks with mixed transparent and opaque pixels, so we have to do one draw per polygon.
@@ -3036,11 +3190,15 @@ void GPU_HW::DispatchRenderCommand()
   const GPUTransparencyMode transparency_mode =
     rc.transparency_enable ? m_draw_mode.mode_reg.transparency_mode : GPUTransparencyMode::Disabled;
   const bool dithering_enable = (!m_true_color && rc.IsDitheringEnabled()) ? m_GPUSTAT.dither_enable : false;
-  if (texture_mode != m_batch.texture_mode || transparency_mode != m_batch.transparency_mode ||
-      (transparency_mode == GPUTransparencyMode::BackgroundMinusForeground && !m_allow_shader_blend) ||
-      dithering_enable != m_batch.dithering)
+  if (!IsFlushed())
   {
-    FlushRender();
+    if (texture_mode != m_batch.texture_mode || transparency_mode != m_batch.transparency_mode ||
+        (transparency_mode == GPUTransparencyMode::BackgroundMinusForeground && !m_allow_shader_blend) ||
+        dithering_enable != m_batch.dithering || use_texture_cache != m_batch.use_texture_cache ||
+        (use_texture_cache && m_batch.texture_cache_key != texture_cache_key))
+    {
+      FlushRender();
+    }
   }
 
   EnsureVertexBufferSpaceForCurrentCommand();
@@ -3084,6 +3242,8 @@ void GPU_HW::DispatchRenderCommand()
     m_batch.texture_mode = texture_mode;
     m_batch.transparency_mode = transparency_mode;
     m_batch.dithering = dithering_enable;
+    m_batch.texture_cache_key = texture_cache_key;
+    m_batch.use_texture_cache = use_texture_cache;
 
     if (m_draw_mode.IsTextureWindowChanged())
     {
@@ -3146,10 +3306,12 @@ void GPU_HW::FlushRender()
     return;
 
 #ifdef _DEBUG
-  GL_SCOPE_FMT("Hardware Draw {}", ++s_draw_number);
+  GL_SCOPE_FMT("Hardware Draw {}: {}", ++s_draw_number, m_current_draw_rect);
 #endif
 
   GL_INS_FMT("Dirty draw area: {}", m_vram_dirty_draw_rect);
+  if (m_compute_uv_range)
+    GL_INS_FMT("UV rect: {}", m_current_uv_rect);
 
   if (m_batch_ubo_dirty)
   {
@@ -3158,20 +3320,27 @@ void GPU_HW::FlushRender()
     m_batch_ubo_dirty = false;
   }
 
+  const GPUTextureCache::Source* texture = nullptr;
+  if (m_batch.texture_mode != GPUTextureMode::Disabled && m_batch.use_texture_cache)
+    texture = LookupSource(m_batch.texture_cache_key, m_current_uv_rect);
+
+  m_current_draw_rect = INVALID_RECT;
+  m_current_uv_rect = INVALID_RECT;
+
   if (m_wireframe_mode != GPUWireframeMode::OnlyWireframe)
   {
     if (NeedsShaderBlending(m_batch.transparency_mode, m_batch.check_mask_before_draw))
     {
-      DrawBatchVertices(BatchRenderMode::ShaderBlend, index_count, base_index, base_vertex);
+      DrawBatchVertices(BatchRenderMode::ShaderBlend, index_count, base_index, base_vertex, texture);
     }
     else if (NeedsTwoPassRendering())
     {
-      DrawBatchVertices(BatchRenderMode::OnlyOpaque, index_count, base_index, base_vertex);
-      DrawBatchVertices(BatchRenderMode::OnlyTransparent, index_count, base_index, base_vertex);
+      DrawBatchVertices(BatchRenderMode::OnlyOpaque, index_count, base_index, base_vertex, texture);
+      DrawBatchVertices(BatchRenderMode::OnlyTransparent, index_count, base_index, base_vertex, texture);
     }
     else
     {
-      DrawBatchVertices(m_batch.GetRenderMode(), index_count, base_index, base_vertex);
+      DrawBatchVertices(m_batch.GetRenderMode(), index_count, base_index, base_vertex, texture);
     }
   }
 
@@ -3187,6 +3356,8 @@ void GPU_HW::UpdateDisplay()
   FlushRender();
 
   GL_SCOPE("UpdateDisplay()");
+
+  GPUTextureCache::AgeHashCache();
 
   if (g_settings.debugging.show_vram)
   {
