@@ -162,9 +162,9 @@ bool PostProcessing::GLSLShader::CompilePipeline(GPUTexture::Format format, u32 
   return true;
 }
 
-bool PostProcessing::GLSLShader::Apply(GPUTexture* input, GPUTexture* final_target, s32 final_left, s32 final_top,
-                                       s32 final_width, s32 final_height, s32 orig_width, s32 orig_height,
-                                       s32 native_width, s32 native_height, u32 target_width, u32 target_height)
+bool PostProcessing::GLSLShader::Apply(GPUTexture* input, GPUTexture* final_target, GSVector4i final_rect,
+                                       s32 orig_width, s32 orig_height, s32 native_width, s32 native_height,
+                                       u32 target_width, u32 target_height)
 {
   GL_SCOPE_FMT("GLSL Shader {}", m_name);
 
@@ -182,12 +182,12 @@ bool PostProcessing::GLSLShader::Apply(GPUTexture* input, GPUTexture* final_targ
 
   g_gpu_device->SetPipeline(m_pipeline.get());
   g_gpu_device->SetTextureSampler(0, input, m_sampler.get());
-  g_gpu_device->SetViewportAndScissor(final_left, final_top, final_width, final_height);
+  g_gpu_device->SetViewportAndScissor(final_rect);
 
   const u32 uniforms_size = GetUniformsSize();
   void* uniforms = g_gpu_device->MapUniformBuffer(uniforms_size);
-  FillUniformBuffer(uniforms, final_left, final_top, final_width, final_height, target_width, target_height, orig_width,
-                    orig_height, native_width, native_height,
+  FillUniformBuffer(uniforms, final_rect.left, final_rect.top, final_rect.width(), final_rect.height(), target_width,
+                    target_height, orig_width, orig_height, native_width, native_height,
                     static_cast<float>(PostProcessing::GetTimer().GetTimeSeconds()));
   g_gpu_device->UnmapUniformBuffer(uniforms_size);
   g_gpu_device->Draw(3, 0);

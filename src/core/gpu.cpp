@@ -349,6 +349,7 @@ bool GPU::DoState(StateWrapper& sw, GPUTexture** host_texture, bool update_displ
     m_draw_mode.texture_page_changed = true;
     m_draw_mode.texture_window_changed = true;
     m_drawing_area_changed = true;
+    SetClampedDrawingArea();
     UpdateDMARequest();
   }
 
@@ -1109,12 +1110,12 @@ void GPU::UpdateCommandTickEvent()
 void GPU::ConvertScreenCoordinatesToDisplayCoordinates(float window_x, float window_y, float* display_x,
                                                        float* display_y) const
 {
-  const Common::Rectangle<s32> draw_rc =
-    CalculateDrawRect(g_gpu_device->GetWindowWidth(), g_gpu_device->GetWindowHeight());
+  const GSVector4i draw_rc =
+    CalculateDrawRect(g_gpu_device->GetWindowWidth(), g_gpu_device->GetWindowHeight(), true, true);
 
   // convert coordinates to active display region, then to full display region
-  const float scaled_display_x = (window_x - static_cast<float>(draw_rc.left)) / static_cast<float>(draw_rc.GetWidth());
-  const float scaled_display_y = (window_y - static_cast<float>(draw_rc.top)) / static_cast<float>(draw_rc.GetHeight());
+  const float scaled_display_x = (window_x - static_cast<float>(draw_rc.left)) / static_cast<float>(draw_rc.width());
+  const float scaled_display_y = (window_y - static_cast<float>(draw_rc.top)) / static_cast<float>(draw_rc.height());
 
   // scale back to internal resolution
   *display_x = scaled_display_x * static_cast<float>(m_crtc_state.display_width);
@@ -1651,6 +1652,21 @@ void GPU::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 he
   }
 }
 
+void GPU::SetClampedDrawingArea()
+{
+  if (!IsDrawingAreaIsValid()) [[unlikely]]
+  {
+    m_clamped_drawing_area = GSVector4i::zero();
+    return;
+  }
+
+  const u32 right = std::min(m_drawing_area.right + 1, static_cast<u32>(VRAM_WIDTH));
+  const u32 left = std::min(m_drawing_area.left, std::min(m_drawing_area.right, VRAM_WIDTH - 1));
+  const u32 bottom = std::min(m_drawing_area.bottom + 1, static_cast<u32>(VRAM_HEIGHT));
+  const u32 top = std::min(m_drawing_area.top, std::min(m_drawing_area.bottom, VRAM_HEIGHT - 1));
+  m_clamped_drawing_area = GSVector4i(left, top, right, bottom);
+}
+
 void GPU::SetDrawMode(u16 value)
 {
   GPUDrawModeReg new_mode_reg{static_cast<u16>(value & GPUDrawModeReg::MASK)};
@@ -1958,15 +1974,14 @@ bool GPU::PresentDisplay()
   if (!HasDisplayTexture())
     return g_gpu_device->BeginPresent(false);
 
-  const Common::Rectangle<s32> draw_rect =
-    CalculateDrawRect(g_gpu_device->GetWindowWidth(), g_gpu_device->GetWindowHeight());
+  const GSVector4i draw_rect =
+    CalculateDrawRect(g_gpu_device->GetWindowWidth(), g_gpu_device->GetWindowHeight(), true, true);
   return RenderDisplay(nullptr, draw_rect, true);
 }
 
-bool GPU::RenderDisplay(GPUTexture* target, const Common::Rectangle<s32>& draw_rect, bool postfx)
+bool GPU::RenderDisplay(GPUTexture* target, const GSVector4i draw_rect, bool postfx)
 {
-  GL_SCOPE_FMT("RenderDisplay: {}x{} at {},{}", draw_rect.left, draw_rect.top, draw_rect.GetWidth(),
-               draw_rect.GetHeight());
+  GL_SCOPE_FMT("RenderDisplay: {}x{} at {},{}", draw_rect.left, draw_rect.top, draw_rect.width(), draw_rect.height());
 
   if (m_display_texture)
     m_display_texture->MakeReadyForSampling();
@@ -1997,10 +2012,9 @@ bool GPU::RenderDisplay(GPUTexture* target, const Common::Rectangle<s32>& draw_r
     {
       texture_filter_linear = true;
       uniforms.params[0] = std::max(
-        std::floor(static_cast<float>(draw_rect.GetWidth()) / static_cast<float>(m_display_texture_view_width)), 1.0f);
+        std::floor(static_cast<float>(draw_rect.width()) / static_cast<float>(m_display_texture_view_width)), 1.0f);
       uniforms.params[1] = std::max(
-        std::floor(static_cast<float>(draw_rect.GetHeight()) / static_cast<float>(m_display_texture_view_height)),
-        1.0f);
+        std::floor(static_cast<float>(draw_rect.height()) / static_cast<float>(m_display_texture_view_height)), 1.0f);
       uniforms.params[2] = 0.5f - 0.5f / uniforms.params[0];
       uniforms.params[3] = 0.5f - 0.5f / uniforms.params[1];
     }
@@ -2018,7 +2032,7 @@ bool GPU::RenderDisplay(GPUTexture* target, const Common::Rectangle<s32>& draw_r
     (postfx && HasDisplayTexture() && PostProcessing::IsActive() && !g_gpu_device->GetWindowInfo().IsSurfaceless() &&
      hdformat != GPUTexture::Format::Unknown && target_width > 0 && target_height > 0 &&
      PostProcessing::CheckTargets(hdformat, target_width, target_height));
-  const Common::Rectangle<s32> real_draw_rect =
+  const GSVector4i real_draw_rect =
     g_gpu_device->UsesLowerLeftOrigin() ? GPUDevice::FlipToLowerLeft(draw_rect, target_height) : draw_rect;
   if (really_postfx)
   {
@@ -2060,8 +2074,7 @@ bool GPU::RenderDisplay(GPUTexture* target, const Common::Rectangle<s32>& draw_r
   uniforms.src_size[3] = rcp_height;
   g_gpu_device->PushUniformBuffer(&uniforms, sizeof(uniforms));
 
-  g_gpu_device->SetViewportAndScissor(real_draw_rect.left, real_draw_rect.top, real_draw_rect.GetWidth(),
-                                      real_draw_rect.GetHeight());
+  g_gpu_device->SetViewportAndScissor(real_draw_rect);
   g_gpu_device->Draw(3, 0);
 
   if (really_postfx)
@@ -2074,14 +2087,11 @@ bool GPU::RenderDisplay(GPUTexture* target, const Common::Rectangle<s32>& draw_r
     const s32 orig_width = static_cast<s32>(std::ceil(m_display_width * upscale_x));
     const s32 orig_height = static_cast<s32>(std::ceil(m_display_height * upscale_y));
 
-    return PostProcessing::Apply(target, real_draw_rect.left, real_draw_rect.top, real_draw_rect.GetWidth(),
-                                 real_draw_rect.GetHeight(), orig_width, orig_height, m_display_width,
+    return PostProcessing::Apply(target, real_draw_rect, orig_width, orig_height, m_display_width,
                                  m_display_height);
   }
   else
-  {
     return true;
-  }
 }
 
 void GPU::DestroyDeinterlaceTextures()
@@ -2304,9 +2314,8 @@ bool GPU::ApplyChromaSmoothing(GPUTexture* src, u32 x, u32 y, u32 width, u32 hei
   return true;
 }
 
-Common::Rectangle<float> GPU::CalculateDrawRect(s32 window_width, s32 window_height, float* out_left_padding,
-                                                float* out_top_padding, float* out_scale, float* out_x_scale,
-                                                bool apply_aspect_ratio /* = true */) const
+GSVector4i GPU::CalculateDrawRect(s32 window_width, s32 window_height, bool apply_aspect_ratio,
+                                  bool apply_padding) const
 {
   const bool integer_scale = (g_settings.display_scaling == DisplayScalingMode::NearestInteger ||
                               g_settings.display_scaling == DisplayScalingMode::BlinearInteger);
@@ -2329,8 +2338,8 @@ Common::Rectangle<float> GPU::CalculateDrawRect(s32 window_width, s32 window_hei
   const float active_height = g_settings.display_stretch_vertically ?
                                 static_cast<float>(m_display_active_height) / x_scale :
                                 static_cast<float>(m_display_active_height);
-  if (out_x_scale)
-    *out_x_scale = x_scale;
+  float left_padding = 0.0f;
+  float top_padding = 0.0f;
 
   // now fit it within the window
   float scale;
@@ -2341,29 +2350,23 @@ Common::Rectangle<float> GPU::CalculateDrawRect(s32 window_width, s32 window_hei
     if (integer_scale)
       scale = std::max(std::floor(scale), 1.0f);
 
-    if (out_left_padding)
+    if (apply_padding)
     {
       if (integer_scale)
-        *out_left_padding = std::max<float>((static_cast<float>(window_width) - display_width * scale) / 2.0f, 0.0f);
-      else
-        *out_left_padding = 0.0f;
-    }
-    if (out_top_padding)
-    {
+        left_padding = std::max<float>((static_cast<float>(window_width) - display_width * scale) / 2.0f, 0.0f);
+
       switch (g_settings.display_alignment)
       {
         case DisplayAlignment::RightOrBottom:
-          *out_top_padding = std::max<float>(static_cast<float>(window_height) - (display_height * scale), 0.0f);
+          top_padding = std::max<float>(static_cast<float>(window_height) - (display_height * scale), 0.0f);
           break;
 
         case DisplayAlignment::Center:
-          *out_top_padding =
-            std::max<float>((static_cast<float>(window_height) - (display_height * scale)) / 2.0f, 0.0f);
+          top_padding = std::max<float>((static_cast<float>(window_height) - (display_height * scale)) / 2.0f, 0.0f);
           break;
 
         case DisplayAlignment::LeftOrTop:
         default:
-          *out_top_padding = 0.0f;
           break;
       }
     }
@@ -2375,53 +2378,35 @@ Common::Rectangle<float> GPU::CalculateDrawRect(s32 window_width, s32 window_hei
     if (integer_scale)
       scale = std::max(std::floor(scale), 1.0f);
 
-    if (out_left_padding)
+    if (apply_padding)
     {
       switch (g_settings.display_alignment)
       {
         case DisplayAlignment::RightOrBottom:
-          *out_left_padding = std::max<float>(static_cast<float>(window_width) - (display_width * scale), 0.0f);
+          left_padding = std::max<float>(static_cast<float>(window_width) - (display_width * scale), 0.0f);
           break;
 
         case DisplayAlignment::Center:
-          *out_left_padding =
-            std::max<float>((static_cast<float>(window_width) - (display_width * scale)) / 2.0f, 0.0f);
+          left_padding = std::max<float>((static_cast<float>(window_width) - (display_width * scale)) / 2.0f, 0.0f);
           break;
 
         case DisplayAlignment::LeftOrTop:
         default:
-          *out_left_padding = 0.0f;
           break;
       }
-    }
 
-    if (out_top_padding)
-    {
       if (integer_scale)
-        *out_top_padding = std::max<float>((static_cast<float>(window_height) - (display_height * scale)) / 2.0f, 0.0f);
-      else
-        *out_top_padding = 0.0f;
+        top_padding = std::max<float>((static_cast<float>(window_height) - (display_height * scale)) / 2.0f, 0.0f);
     }
   }
 
-  if (out_scale)
-    *out_scale = scale;
-
-  return Common::Rectangle<float>::FromExtents(active_left * scale, active_top * scale, active_width * scale,
-                                               active_height * scale);
-}
-
-Common::Rectangle<s32> GPU::CalculateDrawRect(s32 window_width, s32 window_height,
-                                              bool apply_aspect_ratio /* = true */) const
-{
-  float left_padding, top_padding;
-  const Common::Rectangle<float> draw_rc =
-    CalculateDrawRect(window_width, window_height, &left_padding, &top_padding, nullptr, nullptr, apply_aspect_ratio);
-
   // TODO: This should be a float rectangle. But because GL is lame, it only has integer viewports...
-  return Common::Rectangle<s32>::FromExtents(
-    static_cast<s32>(draw_rc.left + left_padding), static_cast<s32>(draw_rc.top + top_padding),
-    static_cast<s32>(draw_rc.GetWidth()), static_cast<s32>(draw_rc.GetHeight()));
+  const float left = active_left * scale + left_padding;
+  const float top = active_top * scale + top_padding;
+  const float right = left + (active_width * scale);
+  const float bottom = top + (active_height * scale);
+
+  return GSVector4i(static_cast<s32>(left), static_cast<s32>(top), static_cast<s32>(right), static_cast<s32>(bottom));
 }
 
 bool CompressAndWriteTextureToFile(u32 width, u32 height, std::string filename, FileSystem::ManagedCFilePtr fp,
@@ -2593,7 +2578,7 @@ bool GPU::WriteDisplayTextureToFile(std::string filename, bool compress_on_threa
     flip_y, std::move(texture_data), texture_data_stride, m_display_texture->GetFormat(), false, compress_on_thread);
 }
 
-bool GPU::RenderScreenshotToBuffer(u32 width, u32 height, const Common::Rectangle<s32>& draw_rect, bool postfx,
+bool GPU::RenderScreenshotToBuffer(u32 width, u32 height, const GSVector4i draw_rect, bool postfx,
                                    std::vector<u32>* out_pixels, u32* out_stride, GPUTexture::Format* out_format)
 {
   const GPUTexture::Format hdformat =
@@ -2645,15 +2630,15 @@ bool GPU::RenderScreenshotToFile(std::string filename, DisplayScreenshotMode mod
 {
   u32 width = g_gpu_device->GetWindowWidth();
   u32 height = g_gpu_device->GetWindowHeight();
-  Common::Rectangle<s32> draw_rect = CalculateDrawRect(width, height);
+  GSVector4i draw_rect = CalculateDrawRect(width, height, true, true);
 
   const bool internal_resolution = (mode != DisplayScreenshotMode::ScreenResolution);
   if (internal_resolution && m_display_texture_view_width != 0 && m_display_texture_view_height != 0)
   {
     if (mode == DisplayScreenshotMode::InternalResolution)
     {
-      const u32 draw_width = static_cast<u32>(draw_rect.GetWidth());
-      const u32 draw_height = static_cast<u32>(draw_rect.GetHeight());
+      const u32 draw_width = static_cast<u32>(draw_rect.width());
+      const u32 draw_height = static_cast<u32>(draw_rect.height());
 
       // If internal res, scale the computed draw rectangle to the internal res.
       // We re-use the draw rect because it's already been AR corrected.
@@ -2697,7 +2682,7 @@ bool GPU::RenderScreenshotToFile(std::string filename, DisplayScreenshotMode mod
     }
 
     // Remove padding, it's not part of the framebuffer.
-    draw_rect.Set(0, 0, static_cast<s32>(width), static_cast<s32>(height));
+    draw_rect = GSVector4i(0, 0, static_cast<s32>(width), static_cast<s32>(height));
   }
   if (width == 0 || height == 0)
     return false;

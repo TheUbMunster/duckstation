@@ -128,8 +128,8 @@ const Common::Timer& GetTimer();
 bool CheckTargets(GPUTexture::Format target_format, u32 target_width, u32 target_height,
                   ProgressCallback* progress = nullptr);
 
-bool Apply(GPUTexture* final_target, s32 final_left, s32 final_top, s32 final_width, s32 final_height, s32 orig_width,
-           s32 orig_height, s32 native_width, s32 native_height);
+bool Apply(GPUTexture* final_target, GSVector4i final_rect, s32 orig_width, s32 orig_height, s32 native_width,
+           s32 native_height);
 
 GPUSampler* GetSampler(const GPUSampler::Config& config);
 GPUTexture* GetDummyTexture();

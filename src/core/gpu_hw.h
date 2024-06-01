@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #pragma once
@@ -9,10 +9,10 @@
 #include "util/gpu_device.h"
 
 #include "common/dimensional_array.h"
+#include "common/gsvector.h"
 #include "common/heap_array.h"
 
-#include <sstream>
-#include <string>
+#include <limits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -116,6 +116,11 @@ private:
     u32 num_uniform_buffer_updates;
   };
 
+  static constexpr GSVector4i VRAM_SIZE_RECT = GSVector4i::cxpr(0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+  static constexpr GSVector4i INVALID_RECT =
+    GSVector4i::cxpr(std::numeric_limits<s32>::max(), std::numeric_limits<s32>::max(), std::numeric_limits<s32>::min(),
+                     std::numeric_limits<s32>::min());
+
   /// Returns true if a depth buffer should be created.
   bool NeedsDepthBuffer() const;
 
@@ -131,7 +136,6 @@ private:
   void PrintSettingsToLog();
   void CheckSettings();
 
-  void SetClampedDrawingArea();
   void UpdateVRAMReadTexture(bool drawn, bool written);
   void UpdateDepthBufferFromMaskBit();
   void ClearDepthBuffer();
@@ -149,9 +153,9 @@ private:
 
   void SetFullVRAMDirtyRectangle();
   void ClearVRAMDirtyRectangle();
-  void IncludeVRAMDirtyRectangle(Common::Rectangle<u32>& rect, const Common::Rectangle<u32>& new_rect);
-  void IncludeDrawnDirtyRectangle(s32 min_x, s32 min_y, s32 max_x, s32 max_y);
-  void CheckForTexPageOverlap(u32 texpage, u32 min_u, u32 min_v, u32 max_u, u32 max_v);
+  void IncludeVRAMDirtyRectangle(GSVector4i& rect, const GSVector4i new_rect);
+  void IncludeDrawnDirtyRectangle(const GSVector4i rect);
+  void CheckForTexPageOverlap(GSVector4i uv_rect);
 
   bool IsFlushed() const;
   void EnsureVertexBufferSpace(u32 required_vertices, u32 required_indices);
@@ -187,10 +191,10 @@ private:
 
   /// Handles quads with flipped texture coordinate directions.
   void HandleFlippedQuadTextureCoordinates(BatchVertex* vertices);
-  void ExpandLineTriangles(BatchVertex* vertices, u32 base_vertex);
+  bool ExpandLineTriangles(BatchVertex* vertices);
 
-  /// Computes polygon U/V boundaries.
-  void ComputePolygonUVLimits(u32 texpage, BatchVertex* vertices, u32 num_vertices);
+  /// Computes polygon U/V boundaries, and for overlap with the current texture page.
+  void ComputePolygonUVLimits(BatchVertex* vertices, u32 num_vertices);
 
   /// Sets the depth test flag for PGXP depth buffering.
   void SetBatchDepthBuffer(bool enabled);
@@ -255,10 +259,9 @@ private:
   BatchUBOData m_batch_ubo_data = {};
 
   // Bounding box of VRAM area that the GPU has drawn into.
-  GPUDrawingArea m_clamped_drawing_area = {};
-  Common::Rectangle<u32> m_vram_dirty_draw_rect;
-  Common::Rectangle<u32> m_vram_dirty_write_rect;
-  Common::Rectangle<u32> m_current_uv_range;
+  GSVector4i m_vram_dirty_draw_rect = INVALID_RECT;
+  GSVector4i m_vram_dirty_write_rect = INVALID_RECT;
+  GSVector4i m_current_uv_range = INVALID_RECT;
 
   std::unique_ptr<GPUPipeline> m_wireframe_pipeline;
 
