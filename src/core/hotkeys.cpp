@@ -421,7 +421,7 @@ DEFINE_HOTKEY("ReloadTextureReplacements", TRANSLATE_NOOP("Hotkeys", "Graphics")
                 {
                   Host::AddKeyedOSDMessage("ReloadTextureReplacements",
                                            TRANSLATE_STR("OSDMessage", "Texture replacements reloaded."), 10.0f);
-                  g_texture_replacements.Reload();
+                  TextureReplacements::Reload();
                 }
               })
 
